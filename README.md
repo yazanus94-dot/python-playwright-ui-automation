@@ -141,7 +141,7 @@ successfully from 2,115 result files produced by the final browser verification 
 
 Failure screenshots are written to `artifacts/screenshots/`, videos to `artifacts/videos/`, and
 both are attached to Allure. A temporary intentional-failure probe verified **1 PNG + 1 WEBM**
-attachment. Final green runs produced 198 videos and no failure screenshots (expected).
+attachment. Final green local runs produced 330 videos and no failure screenshots (expected).
 
 ## 14. Docker
 
