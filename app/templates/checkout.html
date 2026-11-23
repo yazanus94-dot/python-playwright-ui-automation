@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Checkout - ShopEase</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <header class="header">
+        <div class="container">
+            <div class="logo"><a href="/">ShopEase</a></div>
+            <nav class="nav">
+                <a href="/" class="nav-link">Home</a>
+                <a href="/cart" class="nav-link">Cart <span id="cart-count" data-testid="cart-count">{{ cart_count }}</span></a>
+                {% if session.user_email %}
+                    <a href="/orders" class="nav-link">My Orders</a>
+                    <a href="/logout" class="nav-link">Logout</a>
+                {% else %}
+                    <a href="/login" class="nav-link">Login</a>
+                    <a href="/register" class="nav-link">Register</a>
+                {% endif %}
+            </nav>
+        </div>
+    </header>
+
+    <section class="checkout-page">
+        <div class="container">
+            <h1>Checkout</h1>
+
+            {% if error %}
+            <div class="error-message" data-testid="checkout-error">{{ error }}</div>
+            {% endif %}
+
+            <form method="POST" action="/checkout" id="checkout-form" novalidate>
+                <div class="form-group">
+                    <label for="customer-name">Full Name <span class="required">*</span></label>
+                    <input type="text" id="customer-name" data-testid="customer-name" name="customer_name" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="customer-email">Email Address <span class="required">*</span></label>
+                    <input type="email" id="customer-email" data-testid="customer-email" name="customer_email" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="customer-address">Shipping Address <span class="required">*</span></label>
+                    <textarea id="customer-address" data-testid="customer-address" name="customer_address" required></textarea>
+                </div>
+
+                <div class="order-summary">
+                    <h2>Order Summary</h2>
+                    {% for item in cart_items %}
+                    <div class="summary-item">
+                        <span class="summary-item-name">{{ item.name }} x{{ item.quantity }}</span>
+                        <span class="summary-item-price">${{ "%.2f"|format(item.subtotal) }}</span>
+                    </div>
+                    {% endfor %}
+                    <div class="summary-total">
+                        <span>Total:</span>
+                        <span>${{ "%.2f"|format(total) }}</span>
+                    </div>
+                </div>
+
+                <button type="submit" class="btn btn-primary btn-large place-order-btn" data-testid="place-order">Place Order</button>
+                <a href="/cart" class="btn btn-secondary">Back to Cart</a>
+            </form>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <div class="container">
+            <p>&copy; 2026 ShopEase. Premium E-Commerce Demo for QA Automation.</p>
+        </div>
+    </footer>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

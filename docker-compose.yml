@@ -1,0 +1,40 @@
+services:
+  storefront:
+    build: .
+    container_name: shopease-storefront
+    ports:
+      - "5000:5000"
+    environment:
+      SECRET_KEY: compose-demo-secret-key
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - shopease
+
+  tests:
+    build: .
+    container_name: shopease-tests
+    depends_on:
+      storefront:
+        condition: service_healthy
+    environment:
+      EXTERNAL_SUT_URL: http://storefront:5000
+      BROWSER: ${BROWSER:-chromium}
+      SECRET_KEY: compose-demo-secret-key
+    volumes:
+      - ./allure-results:/app/allure-results
+      - ./artifacts:/app/artifacts
+      - ./reports:/app/reports
+    networks:
+      - shopease
+    command: >
+      sh -c "python -m pytest -n 2 -v --alluredir=allure-results
+      --html=reports/pytest-report.html --self-contained-html"
+
+networks:
+  shopease:
+    driver: bridge
