@@ -26,7 +26,7 @@ class BasePage:
     def expect_visible(self, test_id: str) -> None:
         expect(self.page.get_by_test_id(test_id)).to_be_visible(timeout=TIMEOUT)
 
-    def price(self, text: str) -> float:
+    def parse_price(self, text: str) -> float:
         return float(text.replace("$", "").strip())
 
     @property

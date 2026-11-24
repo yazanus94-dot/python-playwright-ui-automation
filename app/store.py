@@ -1,20 +1,35 @@
-"""ShopEase demo storefront — a real, stateful system under test.
+"""ShopEase demo storefront — FastAPI + Jinja2 + SQLite.
 
-All mutable customer state is stored server-side and keyed by an opaque session
-identifier held in a signed cookie. Separate browser contexts therefore cannot
-read or modify each other's carts or orders, including under pytest-xdist.
+The system under test is a real, stateful application. Users, carts and orders
+are persisted in SQLite; an opaque, HMAC-signed session cookie keys each
+browser context to its own server-side state. Independent browser contexts and
+pytest-xdist workers therefore cannot read or modify each other's state.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 import os
+import sqlite3
+import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 MAX_QUANTITY = 10
+COOKIE_NAME = "shopease_session"
+SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-key-for-local-testing-only")
+
 PRODUCTS: list[dict[str, Any]] = [
     {
         "id": 1,
@@ -128,38 +143,101 @@ PRODUCTS: list[dict[str, Any]] = [
     },
 ]
 
-# Server-side state keyed by opaque session id. No cross-context globals.
-CARTS: dict[str, dict[str, int]] = {}
-ORDERS: dict[str, list[dict[str, Any]]] = {}
-USERS: dict[str, dict[str, str]] = {
-    "demo@example.com": {
-        "name": "Demo User",
-        "email": "demo@example.com",
-        "password": "DemoPass123!",
-    },
-}
-
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-key-for-local-testing-only")
-
-
-def current_session_id() -> str:
-    sid = session.get("sid")
-    if not sid:
-        sid = uuid.uuid4().hex
-        session["sid"] = sid
-    return sid
+# ---------------------------------------------------------------------------
+# SQLite persistence — one database file per server process (port), so xdist
+# workers never contend. State is keyed by an opaque session id cookie.
+# ---------------------------------------------------------------------------
+PORT = int(os.environ.get("PORT", "5000"))
+DB_PATH = Path(
+    os.environ.get(
+        "SHOP_EASE_DB",
+        str(Path(tempfile.gettempdir()) / f"shopease_{PORT}.sqlite3"),
+    )
+)
+DB_LOCK = threading.Lock()
 
 
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS users ("
+            "email TEXT PRIMARY KEY, name TEXT NOT NULL, password TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cart_items ("
+            "sid TEXT NOT NULL, product_id INTEGER NOT NULL, quantity INTEGER NOT NULL, "
+            "PRIMARY KEY (sid, product_id))"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS orders ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, sid TEXT NOT NULL, "
+            "order_id TEXT UNIQUE NOT NULL, total REAL NOT NULL, status TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, customer_json TEXT NOT NULL, items_json TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO users (email, name, password) VALUES (?, ?, ?)",
+            ("demo@example.com", "Demo User", "DemoPass123!"),
+        )
+        conn.commit()
+
+
+init_db()
+
+
+# ---------------------------------------------------------------------------
+# Signed cookie sessions (stdlib HMAC — no third-party session dependency).
+# ---------------------------------------------------------------------------
+def _sign(payload: dict[str, str]) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    body = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    mac = hmac.new(SECRET_KEY.encode(), body.encode(), hashlib.sha256).hexdigest()
+    return f"{body}.{mac}"
+
+
+def _unsign(token: str | None) -> dict[str, str] | None:
+    if not token or "." not in token:
+        return None
+    body, mac = token.rsplit(".", 1)
+    expected = hmac.new(SECRET_KEY.encode(), body.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, expected):
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        payload = json.loads(raw)
+        return (
+            payload if isinstance(payload, dict) and isinstance(payload.get("sid"), str) else None
+        )
+    except (ValueError, TypeError):
+        return None
+
+
+def _session(request: Request) -> dict[str, str]:
+    session = getattr(request.state, "session", None)
+    if session is None:
+        session = _unsign(request.cookies.get(COOKIE_NAME)) or {"sid": uuid.uuid4().hex}
+    return session
+
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
 def get_product(product_id: int) -> dict[str, Any] | None:
-    return next((product for product in PRODUCTS if product["id"] == product_id), None)
+    return next((p for p in PRODUCTS if p["id"] == product_id), None)
+
+
+def _cart_rows(sid: str) -> dict[int, int]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT product_id, quantity FROM cart_items WHERE sid = ?", (sid,)
+        ).fetchall()
+    return {int(product_id): int(quantity) for product_id, quantity in rows}
 
 
 def cart_items(sid: str) -> tuple[list[dict[str, Any]], float]:
     items: list[dict[str, Any]] = []
     total = 0.0
-    for product_id, quantity in CARTS.get(sid, {}).items():
-        product = get_product(int(product_id))
+    for product_id, quantity in sorted(_cart_rows(sid).items()):
+        product = get_product(product_id)
         if product:
             subtotal = round(product["price"] * quantity, 2)
             items.append({**product, "quantity": quantity, "subtotal": subtotal})
@@ -168,7 +246,34 @@ def cart_items(sid: str) -> tuple[list[dict[str, Any]], float]:
 
 
 def cart_count(sid: str) -> int:
-    return sum(CARTS.get(sid, {}).values())
+    return sum(_cart_rows(sid).values())
+
+
+def _orders(sid: str) -> list[dict[str, Any]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT order_id, total, status, created_at, customer_json, items_json "
+            "FROM orders WHERE sid = ? ORDER BY id DESC",
+            (sid,),
+        ).fetchall()
+    return [
+        {
+            "order_id": row[0],
+            "total": row[1],
+            "status": row[2],
+            "created_at": row[3],
+            "customer": json.loads(row[4]),
+            "items": json.loads(row[5]),
+        }
+        for row in rows
+    ]
+
+
+def parse_product_id(raw: Any) -> int | None:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_quantity(raw: Any) -> int | None:
@@ -181,214 +286,351 @@ def parse_quantity(raw: Any) -> int | None:
     return quantity
 
 
+async def _payload(request: Request) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            data = await request.json()
+            return data if isinstance(data, dict) else {}
+        except ValueError:
+            return {}
+    form = await request.form()
+    return dict(form)
+
+
+# ---------------------------------------------------------------------------
+# FastAPI application
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+app = FastAPI(title="ShopEase", docs_url=None, redoc_url=None)
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+
+@app.middleware("http")
+async def session_middleware(request: Request, call_next):
+    request.state.session = _session(request)
+    response = await call_next(request)
+    # Always re-set the signed cookie so login/user_email mutations persist.
+    response.set_cookie(
+        COOKIE_NAME,
+        _sign(request.state.session),
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+def _render(
+    request: Request,
+    name: str,
+    extra: dict[str, Any] | None = None,
+    status_code: int = 200,
+    **context: Any,
+) -> HTMLResponse:
+    """Render a template across Starlette's old and new TemplateResponse APIs."""
+    ctx = dict(extra or {})
+    ctx.setdefault("request", request)
+    ctx.setdefault("session", _session(request))
+    ctx.setdefault("url_for", _ctx(request)["url_for"])
+    ctx.update(context)
+    try:
+        return templates.TemplateResponse(request, name, ctx, status_code=status_code)  # type: ignore[call-arg]
+    except TypeError:
+        return templates.TemplateResponse(name, ctx, status_code=status_code)  # type: ignore[call-arg]
+
+
+def _ctx(request: Request, **extra: Any) -> dict[str, Any]:
+    session = _session(request)
+    ctx: dict[str, Any] = {"request": request, "session": session}
+
+    def url_for(name: str, **params: Any) -> str:
+        """Flask-style url_for for template compatibility."""
+        if name == "static":
+            return f"/static/{params.get('filename', '')}"
+        return str(request.url_for(name, **params))
+
+    ctx["url_for"] = url_for
+    ctx.update(extra)
+    return ctx
+
+
 @app.get("/health")
-def health():
-    return jsonify({"status": "ok", "service": "shopease"})
+async def health() -> JSONResponse:
+    return JSONResponse({"status": "ok", "service": "shopease"})
 
 
 @app.get("/")
-def index():
-    query = request.args.get("q", "")
-    category = request.args.get("category", "")
+async def index(request: Request, q: str = "", category: str = "") -> HTMLResponse:
     products = [
         p for p in PRODUCTS if not category or p["category"].casefold() == category.casefold()
     ]
-    if query:
-        needle = query.casefold()
+    if q:
+        needle = q.casefold()
         products = [
             p
             for p in products
             if needle in p["name"].casefold() or needle in p["category"].casefold()
         ]
-    sid = current_session_id()
-    return render_template(
+    sid = _session(request)["sid"]
+    return _render(
+        request,
         "index.html",
-        products=products,
-        categories=sorted({p["category"] for p in PRODUCTS}),
-        cart_count=cart_count(sid),
-        query=query,
-        selected_category=category,
-        session=session,
+        _ctx(
+            request,
+            products=products,
+            categories=sorted({p["category"] for p in PRODUCTS}),
+            cart_count=cart_count(sid),
+            query=q,
+            selected_category=category,
+        ),
     )
 
 
-@app.get("/product/<int:product_id>")
-def product_detail(product_id: int):
+@app.get("/product/{product_id}")
+async def product_detail(product_id: int, request: Request) -> HTMLResponse:
     product = get_product(product_id)
+    sid = _session(request)["sid"]
     if product is None:
-        return render_template("404.html"), 404
-    sid = current_session_id()
-    return render_template(
+        return _render(
+            request, "404.html", _ctx(request, cart_count=cart_count(sid)), status_code=404
+        )
+    return _render(
+        request,
         "product.html",
-        product=product,
-        cart_count=cart_count(sid),
-        max_quantity=MAX_QUANTITY,
-        session=session,
+        _ctx(request, product=product, cart_count=cart_count(sid), max_quantity=MAX_QUANTITY),
     )
 
 
 @app.get("/cart")
-def cart_page():
-    sid = current_session_id()
+async def cart_page(request: Request) -> HTMLResponse:
+    sid = _session(request)["sid"]
     items, total = cart_items(sid)
-    return render_template(
-        "cart.html", cart_items=items, total=total, cart_count=cart_count(sid), session=session
+    return _render(
+        request,
+        "cart.html",
+        _ctx(request, cart_items=items, total=total, cart_count=cart_count(sid)),
     )
 
 
 @app.post("/cart/add")
-def cart_add():
-    payload = request.get_json(silent=True) or request.form
-    try:
-        product_id = int(payload.get("product_id"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Invalid product"}), 400
+async def cart_add(request: Request) -> JSONResponse:
+    payload = await _payload(request)
+    product_id = parse_product_id(payload.get("product_id"))
+    if product_id is None:
+        return JSONResponse({"error": "Invalid product"}, status_code=400)
     quantity = parse_quantity(payload.get("quantity", 1))
     if get_product(product_id) is None:
-        return jsonify({"error": "Product not found"}), 404
+        return JSONResponse({"error": "Product not found"}, status_code=404)
     if quantity is None:
-        return jsonify({"error": f"Quantity must be between 1 and {MAX_QUANTITY}"}), 400
-    sid = current_session_id()
-    cart = CARTS.setdefault(sid, {})
-    key = str(product_id)
-    new_quantity = cart.get(key, 0) + quantity
-    if new_quantity > MAX_QUANTITY:
-        return jsonify({"error": f"Maximum quantity is {MAX_QUANTITY}"}), 400
-    cart[key] = new_quantity
-    return jsonify({"success": True, "cart_count": cart_count(sid)})
+        return JSONResponse(
+            {"error": f"Quantity must be between 1 and {MAX_QUANTITY}"}, status_code=400
+        )
+    sid = _session(request)["sid"]
+    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+        current = conn.execute(
+            "SELECT quantity FROM cart_items WHERE sid = ? AND product_id = ?", (sid, product_id)
+        ).fetchone()
+        new_quantity = (int(current[0]) if current else 0) + quantity
+        if new_quantity > MAX_QUANTITY:
+            return JSONResponse({"error": f"Maximum quantity is {MAX_QUANTITY}"}, status_code=400)
+        conn.execute(
+            "INSERT INTO cart_items (sid, product_id, quantity) VALUES (?, ?, ?) "
+            "ON CONFLICT(sid, product_id) DO UPDATE SET quantity = excluded.quantity",
+            (sid, product_id, new_quantity),
+        )
+        conn.commit()
+    return JSONResponse({"success": True, "cart_count": cart_count(sid)})
 
 
 @app.post("/cart/update")
-def cart_update():
-    payload = request.get_json(silent=True) or request.form
+async def cart_update(request: Request) -> JSONResponse:
+    payload = await _payload(request)
     quantity = parse_quantity(payload.get("quantity", 1))
     if quantity is None:
-        return jsonify({"error": f"Quantity must be between 1 and {MAX_QUANTITY}"}), 400
-    sid = current_session_id()
-    cart = CARTS.setdefault(sid, {})
-    key = str(payload.get("product_id"))
-    if key not in cart:
-        return jsonify({"error": "Product not in cart"}), 404
-    cart[key] = quantity
-    return jsonify({"success": True, "cart_count": cart_count(sid)})
+        return JSONResponse(
+            {"error": f"Quantity must be between 1 and {MAX_QUANTITY}"}, status_code=400
+        )
+    product_id = parse_product_id(payload.get("product_id"))
+    if product_id is None:
+        return JSONResponse({"error": "Product not found"}, status_code=404)
+    sid = _session(request)["sid"]
+    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "UPDATE cart_items SET quantity = ? WHERE sid = ? AND product_id = ?",
+            (quantity, sid, product_id),
+        )
+        if cursor.rowcount == 0:
+            return JSONResponse({"error": "Product not in cart"}, status_code=404)
+        conn.commit()
+    return JSONResponse({"success": True, "cart_count": cart_count(sid)})
 
 
 @app.post("/cart/remove")
-def cart_remove():
-    sid = current_session_id()
-    key = str(
-        request.values.get("product_id") or (request.get_json(silent=True) or {}).get("product_id")
-    )
-    CARTS.setdefault(sid, {}).pop(key, None)
-    return jsonify({"success": True, "cart_count": cart_count(sid)})
+async def cart_remove(request: Request) -> JSONResponse:
+    payload = await _payload(request)
+    raw = payload.get("product_id")
+    sid = _session(request)["sid"]
+    product_id = parse_product_id(raw)
+    if product_id is None:
+        product_id = -1
+    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM cart_items WHERE sid = ? AND product_id = ?", (sid, product_id))
+        conn.commit()
+    return JSONResponse({"success": True, "cart_count": cart_count(sid)})
 
 
-@app.route("/checkout", methods=["GET", "POST"])
-def checkout():
-    sid = current_session_id()
+@app.get("/checkout")
+async def checkout_page(request: Request):
+    sid = _session(request)["sid"]
     items, total = cart_items(sid)
     if not items:
-        return redirect(url_for("index"))
-    if request.method == "POST":
-        name = request.form.get("customer_name", "").strip()
-        email = request.form.get("customer_email", "").strip()
-        address = request.form.get("customer_address", "").strip()
-        if not name or "@" not in email or not address:
-            return render_template(
-                "checkout.html",
+        return RedirectResponse("/", status_code=303)
+    return _render(
+        request,
+        "checkout.html",
+        _ctx(request, cart_items=items, total=total, cart_count=cart_count(sid)),
+    )
+
+
+@app.post("/checkout")
+async def checkout_submit(request: Request) -> Response:
+    sid = _session(request)["sid"]
+    items, total = cart_items(sid)
+    form = await request.form()
+    name = str(form.get("customer_name", "")).strip()
+    email = str(form.get("customer_email", "")).strip()
+    address = str(form.get("customer_address", "")).strip()
+    if not items:
+        return RedirectResponse("/", status_code=303)
+    if not name or "@" not in email or not address:
+        return _render(
+            request,
+            "checkout.html",
+            _ctx(
+                request,
                 cart_items=items,
                 total=total,
                 cart_count=cart_count(sid),
                 error="Please complete all fields.",
-                session=session,
-            )
-        order = {
-            "order_id": uuid.uuid4().hex[:8].upper(),
-            "items": items,
-            "total": total,
-            "status": "confirmed",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "customer": {"name": name, "email": email, "address": address},
-        }
-        ORDERS.setdefault(sid, []).insert(0, order)
-        CARTS[sid] = {}
-        session["user_email"] = email
-        return render_template(
-            "order_confirmation.html", order=order, cart_count=0, session=session
+            ),
         )
-    return render_template(
-        "checkout.html", cart_items=items, total=total, cart_count=cart_count(sid), session=session
-    )
+    order = {
+        "order_id": uuid.uuid4().hex[:8].upper(),
+        "items": items,
+        "total": total,
+        "status": "confirmed",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "customer": {"name": name, "email": email, "address": address},
+    }
+    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO orders (sid, order_id, total, status, created_at, customer_json, items_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                sid,
+                order["order_id"],
+                total,
+                "confirmed",
+                order["created_at"],
+                json.dumps(order["customer"]),
+                json.dumps(order["items"]),
+            ),
+        )
+        conn.execute("DELETE FROM cart_items WHERE sid = ?", (sid,))
+        conn.commit()
+    _session(request)["user_email"] = email
+    return _render(request, "order_confirmation.html", _ctx(request, order=order, cart_count=0))
 
 
 @app.get("/orders")
-def order_history():
-    sid = current_session_id()
+async def order_history(request: Request):
+    session = _session(request)
     if "user_email" not in session:
-        return redirect(url_for("login"))
-    return render_template("order_history.html", orders=ORDERS.get(sid, []), session=session)
+        return RedirectResponse("/login", status_code=303)
+    return _render(request, "order_history.html", _ctx(request, orders=_orders(session["sid"])))
 
 
-@app.get("/orders/<order_id>")
-def order_detail(order_id: str):
-    sid = current_session_id()
-    order = next((o for o in ORDERS.get(sid, []) if o["order_id"] == order_id), None)
+@app.get("/orders/{order_id}")
+async def order_detail(order_id: str, request: Request) -> HTMLResponse:
+    sid = _session(request)["sid"]
+    order = next((o for o in _orders(sid) if o["order_id"] == order_id), None)
     if order is None:
-        return render_template("404.html"), 404
-    return render_template("order_detail.html", order=order, session=session)
+        return _render(
+            request, "404.html", _ctx(request, cart_count=cart_count(sid)), status_code=404
+        )
+    return _render(request, "order_detail.html", _ctx(request, order=order))
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        email = request.form.get("email", "").strip()
-        password = request.form.get("password", "")
-        user = USERS.get(email)
-        if user and user["password"] == password:
-            session["user_email"] = email
-            return redirect(url_for("index"))
-        return render_template("login.html", error="Invalid credentials", session=session)
-    return render_template("login.html", session=session)
+@app.get("/login")
+async def login_page(request: Request) -> HTMLResponse:
+    return _render(request, "login.html", _ctx(request))
 
 
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if request.method == "POST":
-        name = request.form.get("name", "").strip()
-        email = request.form.get("email", "").strip()
-        password = request.form.get("password", "")
-        if not name or "@" not in email or len(password) < 8:
-            return render_template(
-                "register.html", error="Invalid registration data", session=session
+@app.post("/login")
+async def login_submit(request: Request):
+    form = await request.form()
+    email = str(form.get("email", "")).strip()
+    password = str(form.get("password", ""))
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT password FROM users WHERE email = ?", (email,)).fetchone()
+    if row and row[0] == password:
+        _session(request)["user_email"] = email
+        return RedirectResponse("/", status_code=303)
+    return _render(request, "login.html", _ctx(request, error="Invalid credentials"))
+
+
+@app.get("/register")
+async def register_page(request: Request) -> HTMLResponse:
+    return _render(request, "register.html", _ctx(request))
+
+
+@app.post("/register")
+async def register_submit(request: Request):
+    form = await request.form()
+    name = str(form.get("name", "")).strip()
+    email = str(form.get("email", "")).strip()
+    password = str(form.get("password", ""))
+    if not name or "@" not in email or len(password) < 8:
+        return _render(request, "register.html", _ctx(request, error="Invalid registration data"))
+    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+        if conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
+            return _render(
+                request, "register.html", _ctx(request, error="Email already registered")
             )
-        if email in USERS:
-            return render_template(
-                "register.html", error="Email already registered", session=session
-            )
-        USERS[email] = {"name": name, "email": email, "password": password}
-        session["user_email"] = email
-        return redirect(url_for("index"))
-    return render_template("register.html", session=session)
+        conn.execute(
+            "INSERT INTO users (email, name, password) VALUES (?, ?, ?)", (email, name, password)
+        )
+        conn.commit()
+    _session(request)["user_email"] = email
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/logout")
-def logout():
-    session.pop("user_email", None)
-    return redirect(url_for("index"))
+async def logout(request: Request) -> RedirectResponse:
+    _session(request).pop("user_email", None)
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/api/products")
-def api_products():
-    return jsonify(PRODUCTS)
+async def api_products() -> JSONResponse:
+    return JSONResponse(PRODUCTS)
 
 
-@app.get("/api/products/<int:product_id>")
-def api_product(product_id: int):
+@app.get("/api/products/{product_id}")
+async def api_product(product_id: int) -> JSONResponse:
     product = get_product(product_id)
     if product is None:
-        return jsonify({"error": "Not found"}), 404
-    return jsonify(product)
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return JSONResponse(product)
+
+
+# Backwards-compatible alias used by app.main.
+application = app
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")

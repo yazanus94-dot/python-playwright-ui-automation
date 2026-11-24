@@ -74,7 +74,7 @@ def test_checkout_does_not_clear_other_cart(two_contexts, live_server: str) -> N
 
 def test_two_contexts_can_checkout_concurrently(two_contexts, live_server: str) -> None:
     page_a, page_b = two_contexts
-    ids = []
+    ids: list[str] = []
     for page in (page_a, page_b):
         catalog = _catalog(page, live_server)
         catalog.open()

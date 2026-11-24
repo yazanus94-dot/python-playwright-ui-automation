@@ -12,6 +12,7 @@ __pycache__/
 venv/
 node_modules/
 allure-results/
+allure-results-*/
 allure-report/
 artifacts/
 reports/

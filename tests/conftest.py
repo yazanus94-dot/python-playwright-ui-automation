@@ -6,8 +6,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from pathlib import Path
 
 import allure
@@ -54,6 +55,14 @@ def live_server() -> Iterator[str]:
 
     env = os.environ.copy()
     env["PORT"] = str(PORT)
+    # SQLite persists between runs; start each local session from a clean DB
+    # so tests are idempotent and parallel workers stay isolated.
+    db_path = (
+        Path(env.get("SHOP_EASE_DB", ""))
+        if env.get("SHOP_EASE_DB")
+        else Path(tempfile.gettempdir()) / f"shopease_{PORT}.sqlite3"
+    )
+    db_path.unlink(missing_ok=True)
     process = subprocess.Popen(
         [sys.executable, str(ROOT / "app" / "store.py")],
         cwd=ROOT,
@@ -115,13 +124,13 @@ def _safe(value: str) -> str:
 
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
-def pytest_runtest_makereport(item: pytest.Item, call: object) -> None:
+def pytest_runtest_makereport(item: pytest.Item, call: object) -> Generator[None, object, None]:
     outcome = yield
-    report = outcome.get_result()
+    report = outcome.get_result()  # type: ignore[attr-defined]
     setattr(item, f"rep_{report.when}", report)
     if report.when != "call" or not report.failed:
         return
-    driver = item.funcargs.get("page")
+    driver = getattr(item, "funcargs", {}).get("page")
     if driver is None:
         return
     from config.settings import SCREENSHOTS
