@@ -336,9 +336,9 @@ def _render(
     ctx.setdefault("url_for", _ctx(request)["url_for"])
     ctx.update(context)
     try:
-        return templates.TemplateResponse(request, name, ctx, status_code=status_code)  # type: ignore[call-arg]
+        return templates.TemplateResponse(request, name, ctx, status_code=status_code)  # type: ignore
     except TypeError:
-        return templates.TemplateResponse(name, ctx, status_code=status_code)  # type: ignore[call-arg]
+        return templates.TemplateResponse(name, ctx, status_code=status_code)  # type: ignore
 
 
 def _ctx(request: Request, **extra: Any) -> dict[str, Any]:
